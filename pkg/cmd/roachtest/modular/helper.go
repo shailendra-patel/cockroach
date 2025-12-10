@@ -40,6 +40,9 @@ type Helper struct {
 	background   task.Manager
 	ctx          context.Context
 	stateTracker *ClusterStateTracker
+	// gc is the garbage collector for plan-scoped cleanup.
+	// It manages the plan schema and cleanup of global objects.
+	gc *GarbageCollector
 }
 
 func (h *Helper) AvailableNodes() option.NodeListOption {
@@ -102,67 +105,87 @@ func (h *Helper) CreateTable(namePrefix, schema string) (string, error) {
 	return tableName, h.Exec(query)
 }
 
-// SetClusterSetting sets a cluster setting.
+// SetClusterSetting sets a cluster setting and registers restoration on cleanup.
+// Cluster settings are global and cannot be scoped to a schema, so we capture
+// the original value and register a cleanup statement to restore it.
 func (h *Helper) SetClusterSetting(settingName, newValue string) error {
-	if err := h.stateTracker.maybeTrackClusterSetting(settingName, h.RandomDBConn); err != nil {
-		return fmt.Errorf("failed to track cluster setting before modification: %w", err)
+	// Capture the current value for restoration during cleanup
+	if h.gc != nil && h.gc.Enabled() {
+		var currentValue string
+		row := h.QueryRow(fmt.Sprintf("SHOW CLUSTER SETTING %s", settingName))
+		if err := row.Scan(&currentValue); err != nil {
+			return fmt.Errorf("failed to read current value of %s: %w", settingName, err)
+		}
+
+		// Register cleanup to restore original value (LIFO order)
+		h.gc.Stack().PushSQL(
+			fmt.Sprintf("Restore cluster setting %s to '%s'", settingName, currentValue),
+			fmt.Sprintf("SET CLUSTER SETTING %s = '%s'", settingName, currentValue),
+		)
 	}
+
 	// Use parameterized query for the value but format the setting name
 	query := fmt.Sprintf("SET CLUSTER SETTING %s = $1", settingName)
 	return h.Exec(query, newValue)
 }
 
 // ResetClusterSetting resets a cluster setting to its default value.
+// If GC is enabled, it captures the current value before reset to allow restoration.
 func (h *Helper) ResetClusterSetting(settingName string) error {
-	if err := h.stateTracker.maybeTrackClusterSetting(settingName, h.RandomDBConn); err != nil {
-		return fmt.Errorf("failed to track cluster setting before reset: %w", err)
+	// Capture the current value for restoration during cleanup
+	if h.gc != nil && h.gc.Enabled() {
+		var currentValue string
+		row := h.QueryRow(fmt.Sprintf("SHOW CLUSTER SETTING %s", settingName))
+		if err := row.Scan(&currentValue); err != nil {
+			return fmt.Errorf("failed to read current value of %s: %w", settingName, err)
+		}
+
+		// Register cleanup to restore original value (LIFO order)
+		h.gc.Stack().PushSQL(
+			fmt.Sprintf("Restore cluster setting %s to '%s'", settingName, currentValue),
+			fmt.Sprintf("SET CLUSTER SETTING %s = '%s'", settingName, currentValue),
+		)
 	}
 	return h.Exec(fmt.Sprintf("RESET CLUSTER SETTING %s", settingName))
 }
 
-// AlterRange alters a range's zone configuration with automatic tracking.
+// AlterRange alters a range's zone configuration.
+// If GC is enabled, it captures the original zone config before modification.
 func (h *Helper) AlterRange(rangeName, zoneConfig string) error {
-	if err := h.stateTracker.maybeTrackZoneConfig(rangeName, h.RandomDBConn); err != nil {
-		return fmt.Errorf("failed to track zone config before modification: %w", err)
+	// Capture the original zone config for restoration during cleanup
+	if h.gc != nil && h.gc.Enabled() {
+		var currentConfig string
+		row := h.QueryRow(fmt.Sprintf("SHOW ZONE CONFIGURATION FOR RANGE %s", rangeName))
+		if err := row.Scan(&currentConfig); err != nil {
+			// If we can't read the current config, just proceed without tracking
+			// This handles cases where the range doesn't have an explicit zone config
+			h.logger.Printf("Note: Could not capture original zone config for %s: %v", rangeName, err)
+		} else {
+			// Register cleanup to restore original zone config (LIFO order)
+			h.gc.Stack().PushSQL(
+				fmt.Sprintf("Restore zone config for RANGE %s", rangeName),
+				fmt.Sprintf("ALTER RANGE %s CONFIGURE ZONE USING %s", rangeName, currentConfig),
+			)
+		}
 	}
 	return h.Exec(fmt.Sprintf("ALTER RANGE %s CONFIGURE ZONE USING %s", rangeName, zoneConfig))
 }
 
-// AlterAllRanges alters zone configuration for all system ranges, the default range,
-// and all previously tracked zone configs (tables/databases with explicit overrides).
+// AlterAllRanges alters zone configuration for all system ranges and the default range.
 // This ensures complete coverage:
 // - System ranges (meta, system, liveness, timeseries)
 // - Default zone (for future tables)
-// - All previously modified zones (tables/databases with explicit configs)
 func (h *Helper) AlterAllRanges(zoneConfig string) error {
-	// First, update all standard system and default ranges
-	systemRanges := map[string]struct{}{
-		"meta":       {},
-		"system":     {},
-		"liveness":   {},
-		"timeseries": {},
-		"default":    {},
+	// Update all standard system and default ranges
+	systemRanges := []string{
+		"meta",
+		"system",
+		"liveness",
+		"timeseries",
+		"default",
 	}
 
-	for rangeName := range systemRanges {
-		if err := h.AlterRange(rangeName, zoneConfig); err != nil {
-			return err
-		}
-	}
-
-	// Collect all tracked zone configs to update
-	var trackedRanges []string
-	h.stateTracker.zoneConfigs.Range(func(key, value interface{}) bool {
-		rangeName := key.(string)
-		// Skip if it's a system range we already updated
-		if _, isSystemRange := systemRanges[rangeName]; !isSystemRange {
-			trackedRanges = append(trackedRanges, rangeName)
-		}
-		return true // continue iteration
-	})
-
-	// Update all tracked zone configs (tables/databases with explicit overrides)
-	for _, rangeName := range trackedRanges {
+	for _, rangeName := range systemRanges {
 		if err := h.AlterRange(rangeName, zoneConfig); err != nil {
 			return fmt.Errorf("failed to alter zone config for %s: %w", rangeName, err)
 		}
@@ -182,13 +205,41 @@ func (h *Helper) CreateUserPassword(namePrefix, password string, args ...string)
 	return h.CreateUser(namePrefix, args...)
 }
 
-// TOOD: InjectFailure
+// TODO: InjectFailure
 
 // CreateDatabase creates a database with automatic name generation and tracking.
+// Since databases are external to the plan schema, cleanup is registered.
 func (h *Helper) CreateDatabase(namePrefix string, args ...string) (string, error) {
 	dbName := h.stateTracker.NewDatabaseName(namePrefix)
 	query := fmt.Sprintf("CREATE DATABASE %s %s", dbName, joinArgs(args...))
-	return dbName, h.Exec(strings.TrimSpace(query))
+	if err := h.Exec(strings.TrimSpace(query)); err != nil {
+		return "", err
+	}
+
+	// Register cleanup for external database
+	if h.gc != nil && h.gc.Enabled() {
+		h.gc.Stack().PushSQL(
+			fmt.Sprintf("Drop database %s", dbName),
+			fmt.Sprintf("DROP DATABASE IF EXISTS %s CASCADE", dbName),
+		)
+	}
+
+	return dbName, nil
+}
+
+// RegisterCleanup allows registering a custom cleanup statement.
+// Use this for objects created outside of standard Helper methods,
+// such as databases created by external workloads (TPCC, YCSB, etc.).
+func (h *Helper) RegisterCleanup(description, statement string) {
+	if h.gc != nil && h.gc.Enabled() {
+		h.gc.Stack().PushSQL(description, statement)
+	}
+}
+
+// GC returns the garbage collector for direct access if needed.
+// Use with caution; prefer using Helper methods that auto-register cleanup.
+func (h *Helper) GC() *GarbageCollector {
+	return h.gc
 }
 
 // CreateSchema creates a schema with automatic name generation and tracking.
@@ -443,7 +494,13 @@ type Service struct {
 }
 
 func (s *Service) AvailableNodes() option.NodeListOption {
-	return s.monitor.AvailableNodes(s.name).Intersect(s.nodes)
+	monitorNodes := s.monitor.AvailableNodes(s.name)
+	if len(monitorNodes) == 0 {
+		// If the monitor doesn't have any nodes tracked yet (e.g., early in test setup),
+		// fall back to the configured nodes.
+		return s.nodes
+	}
+	return monitorNodes.Intersect(s.nodes)
 }
 
 func (s *Service) RandomAvailableNode(rng *rand.Rand) int {

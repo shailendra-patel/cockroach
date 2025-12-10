@@ -1,5 +1,7 @@
 package modular
 
+import "time"
+
 // StepBuilder allows method chaining for building step sequences.
 type StepBuilder struct {
 	test  *Test
@@ -182,6 +184,39 @@ func (ob *OperationBuilder) MaybeAnd(condition bool, stepName string, fn stepFun
 	ob.Chain[lastStepGroupIndex] = append(ob.Chain[lastStepGroupIndex], step)
 
 	return ob
+}
+
+// BuilderOperation wraps an OperationBuilder to implement the Operation interface.
+// This allows OperationBuilder to be used wherever Operation is expected.
+type BuilderOperation struct {
+	name    string
+	builder *OperationBuilder
+}
+
+// Build converts an OperationBuilder into an Operation with the given name.
+// This is a convenience method for simple operations that don't need custom
+// Precondition or Timeout implementations.
+func (ob *OperationBuilder) Build(name string) Operation {
+	return &BuilderOperation{
+		name:    name,
+		builder: ob,
+	}
+}
+
+func (bo *BuilderOperation) Chain() Chain {
+	return bo.builder.Chain
+}
+
+func (bo *BuilderOperation) Name() string {
+	return bo.name
+}
+
+func (bo *BuilderOperation) Precondition() bool {
+	return true
+}
+
+func (bo *BuilderOperation) Timeout() time.Duration {
+	return 0 // No timeout by default
 }
 
 func (t *Test) AddOperation(stage *Stage, op Operation, opts ...StepOption) {

@@ -14,7 +14,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/failureinjection/failures"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 )
 
@@ -28,16 +28,28 @@ type Runner struct {
 	testPlan     *TestPlan
 	helper       *Helper
 	stateTracker *ClusterStateTracker
+	gc           *GarbageCollector
 }
 
 // NewRunner creates a new runner for executing a test plan.
 func NewRunner(testPlan *TestPlan) *Runner {
 	clusterStateLogger := testPlan.debugModules.NewLogger(testPlan.logger, ClusterStateDebug)
+	gcLogger := testPlan.debugModules.NewLogger(testPlan.logger, GCDebug)
+
+	// Create GC with connection function (will be set up properly in initializeHelper)
+	// For now, create with a placeholder that will be replaced
+	gc := NewGarbageCollector(
+		testPlan.seed,
+		nil, // connFunc will be set in initializeHelper
+		gcLogger,
+		testPlan.gcConfig,
+	)
 
 	return &Runner{
 		testPlan:     testPlan,
 		helper:       &Helper{rng: testPlan.rng},
 		stateTracker: NewClusterStateTracker(clusterStateLogger),
+		gc:           gc,
 	}
 }
 
@@ -48,12 +60,95 @@ func RunTestPlan(ctx context.Context, t test.Test, testPlan *TestPlan) error {
 	return runner.Run(ctx, t)
 }
 
+// RunPlan is a convenience function that executes a sequence of Operations directly.
+// This is useful for simple test scenarios that don't need the full test planning
+// infrastructure (stages, setup, after-test hooks, etc.).
+func RunPlan(ctx context.Context, l *logger.Logger, c cluster.Cluster, operations []Operation) error {
+	for i, op := range operations {
+		l.Printf("Running operation %d/%d: %s", i+1, len(operations), op.Name())
+
+		// Create a minimal helper for running the operation
+		helper := &Helper{
+			ctx:    ctx,
+			logger: l,
+		}
+
+		// Set up cluster connection if available
+		if c != nil {
+			helper.cluster = c
+			helper.defaultService = &Service{
+				name:       install.SystemInterfaceName,
+				ctx:        ctx,
+				stepLogger: l,
+				cluster:    c,
+				nodes:      c.CRDBNodes(),
+				connFunc: func(node int) *gosql.DB {
+					return c.Conn(ctx, l, node)
+				},
+			}
+		}
+
+		// Execute each step in the operation's chain
+		chain := op.Chain()
+		for stepIdx, stepGroup := range chain {
+			for _, step := range stepGroup {
+				stepLogger, err := l.ChildLogger(fmt.Sprintf("%d_%s_%d", i, op.Name(), stepIdx))
+				if err != nil {
+					stepLogger = l // Fall back to parent logger
+				}
+
+				if err := step.Run(ctx, stepLogger, helper); err != nil {
+					return fmt.Errorf("operation %s step %d failed: %w", op.Name(), stepIdx, err)
+				}
+			}
+		}
+
+		l.Printf("Completed operation %d/%d: %s", i+1, len(operations), op.Name())
+	}
+
+	return nil
+}
+
 // Run executes the test plan, logging the DAG and test plan before execution.
 func (r *Runner) Run(ctx context.Context, t test.Test) error {
 	l := t.L()
 
-	// Initialize the helper with test context
+	// Phase 0: Ensure the cluster is running before any initialization.
+	// This is a temporary fix - ideally tests should explicitly start the cluster
+	// in a Setup step, but for now we auto-start if needed.
+	if r.testPlan.cluster != nil {
+		if err := r.ensureClusterRunning(ctx, t); err != nil {
+			return fmt.Errorf("failed to ensure cluster is running: %w", err)
+		}
+	}
+
+	// Phase 1: Set up basic GC connection (without search_path) and create schema
+	// This must happen BEFORE we set up helper connections with search_path
+	if r.gc.Enabled() && r.testPlan.cluster != nil {
+		// Set up a basic connection for schema creation (no search_path yet)
+		r.gc.connFunc = func() *gosql.DB {
+			return r.testPlan.cluster.Conn(ctx, t.L(), 1)
+		}
+
+		// Create the plan schema
+		if err := r.gc.Initialize(ctx); err != nil {
+			return fmt.Errorf("failed to initialize GC: %w", err)
+		}
+	}
+
+	// Phase 2: Initialize helper with connections that use the plan schema
+	// Now that schema exists, connections can safely set search_path to it
 	r.initializeHelper(ctx, t)
+
+	// Always run cleanup at the end (success or failure)
+	defer func() {
+		if r.gc.Enabled() {
+			l.Printf("Executing cleanup...")
+			if err := r.gc.ExecuteCleanup(ctx); err != nil {
+				l.Printf("Cleanup completed with errors: %v", err)
+			}
+		}
+	}()
 
 	// Log the test plan details
 	l.Printf("Seed: %d", r.testPlan.seed)
@@ -80,6 +175,7 @@ func (r *Runner) initializeHelper(ctx context.Context, t test.Test) {
 	r.helper.ctx = ctx
 	r.helper.logger = t.L()
 	r.helper.stateTracker = r.stateTracker
+	r.helper.gc = r.gc
 
 	// Use the test's task management interface
 	r.helper.background = &testTaskManager{test: t}
@@ -96,14 +192,30 @@ func (r *Runner) initializeHelper(ctx context.Context, t test.Test) {
 	// Set up connection function if cluster is available
 	var connFunc func(int) *gosql.DB
 	if c != nil {
+		// Build connection options, including search_path if GC is enabled
+		var connOpts []option.OptionFunc
+		if r.gc.Enabled() {
+			// Set search_path to plan schema so unqualified table names use it.
+			// Note: We only include the plan schema here, not "public", because
+			// the comma in "schema, public" causes parsing issues in connection options.
+			// Public schema objects can be accessed with explicit qualification if needed.
+			connOpts = append(connOpts, option.ConnectionOption("options", "-c search_path="+r.gc.Schema().Name))
+		}
+
 		connFunc = func(node int) *gosql.DB {
-			return c.Conn(ctx, t.L(), node)
+			return c.Conn(ctx, t.L(), node, connOpts...)
+		}
+
+		// Update GC with the connection function (uses node 1 by default for cleanup)
+		r.gc.connFunc = func() *gosql.DB {
+			return c.Conn(ctx, t.L(), 1, connOpts...)
 		}
 	}
 
-	// Set up the default service with cluster functionality
+	// Set up the default service with cluster functionality.
+	// Use SystemInterfaceName ("system") so the monitor can track available nodes.
 	r.helper.defaultService = &Service{
-		name:       "default",
+		name:       install.SystemInterfaceName,
 		ctx:        ctx,
 		connFunc:   connFunc,
 		stepLogger: t.L(),
@@ -161,6 +273,7 @@ func (r *Runner) extractStages() []Stage {
 }
 
 // executeSteps executes all steps in the test plan sequentially by stage.
+// Cleanup is handled by the defer in Run(), so no manual cleanup logic here.
 func (r *Runner) executeSteps(ctx context.Context, l *logger.Logger) error {
 	for stageIdx, stagePlan := range r.testPlan.stagePlans {
 		stageName := stagePlan.stage.name
@@ -178,13 +291,6 @@ func (r *Runner) executeSteps(ctx context.Context, l *logger.Logger) error {
 
 		err = r.executeStage(ctx, stageLogger, stagePlan)
 		if err != nil {
-			// Attempt to restore cluster state before returning the error (if enabled)
-			if r.testPlan.cleanupOnFailure {
-				l.Printf("Attempting to restore cluster state due to execution failure...")
-				if restoreErr := r.restoreClusterState(ctx, l); restoreErr != nil {
-					l.Printf("Failed to restore cluster state: %v", restoreErr)
-				}
-			}
 			return r.stageError(ctx, err, stageName, stageLogger)
 		}
 
@@ -283,117 +389,30 @@ func (r *Runner) stageError(ctx context.Context, err error, stageName string, l 
 	return stageErr
 }
 
-// restoreClusterState attempts to restore the cluster to its original state by
-// reversing all tracked changes. This should be called on test failure.
-func (r *Runner) restoreClusterState(ctx context.Context, l *logger.Logger) error {
-	l.Printf("Starting cluster state restoration...")
-
-	// Get all tracked state from the state tracker
-	tables, settings, zoneConfigs, failureMap, schemas, users, databases := r.stateTracker.GetTrackedState()
-
-	// Restore cluster settings to original values
-	for setting, originalValue := range settings {
-		if err := r.restoreClusterSetting(ctx, l, setting, originalValue); err != nil {
-			l.Printf("Failed to restore cluster setting %s: %v", setting, err)
-			// Continue with other restorations
-		}
+// recoverFromFailures attempts to recover from all injected failures.
+// This is called during cleanup to ensure the cluster is returned to a healthy state.
+func (r *Runner) recoverFromFailures(ctx context.Context, l *logger.Logger) error {
+	failureMap := r.stateTracker.GetTrackedFailures()
+	if len(failureMap) == 0 {
+		return nil
 	}
 
-	// Restore zone configurations to original values
-	for rangeName, originalConfig := range zoneConfigs {
-		if err := r.restoreZoneConfig(ctx, l, rangeName, originalConfig); err != nil {
-			l.Printf("Failed to restore zone config for %s: %v", rangeName, err)
-			// Continue with other restorations
-		}
-	}
-
-	// Drop tables that were created
-	for _, table := range tables {
-		if err := r.dropTable(ctx, l, table); err != nil {
-			l.Printf("Failed to drop table %s: %v", table, err)
-			// Continue with other restorations
-		}
-	}
-
-	// Drop schemas that were created
-	for _, schema := range schemas {
-		if err := r.dropSchema(ctx, l, schema); err != nil {
-			l.Printf("Failed to drop schema %s: %v", schema, err)
-			// Continue with other restorations
-		}
-	}
-
-	// Drop users that were created
-	for _, user := range users {
-		if err := r.dropUser(ctx, l, user); err != nil {
-			l.Printf("Failed to drop user %s: %v", user, err)
-			// Continue with other restorations
-		}
-	}
-
-	// Drop databases that were created
-	for _, db := range databases {
-		if err := r.dropDatabase(ctx, l, db); err != nil {
-			l.Printf("Failed to drop database %s: %v", db, err)
-			// Continue with other restorations
-		}
-	}
-
-	// Recover from failures that were injected
+	l.Printf("Recovering from %d injected failures...", len(failureMap))
+	var lastErr error
 	for failureID, failer := range failureMap {
-		if err := r.recoverFromFailure(ctx, l, failureID, failer); err != nil {
+		l.Printf("Recovering from failure %s: %s", failureID, failer.Description())
+		if err := failer.Recover(ctx, l); err != nil {
 			l.Printf("Failed to recover from failure %s: %v", failureID, err)
-			// Continue with other restorations
+			lastErr = err
+			// Continue with other recoveries
 		}
 	}
 
-	l.Printf("Cluster state restoration completed")
+	if lastErr != nil {
+		return fmt.Errorf("failure recovery completed with errors")
+	}
+	l.Printf("Failure recovery completed successfully")
 	return nil
-}
-
-// restoreClusterSetting restores a cluster setting to its original value.
-func (r *Runner) restoreClusterSetting(ctx context.Context, l *logger.Logger, setting, originalValue string) error {
-	l.Printf("Restoring cluster setting %s to original value: %s", setting, originalValue)
-	// Use parameterized query for the value but format the setting name
-	query := fmt.Sprintf("SET CLUSTER SETTING %s = $1", setting)
-	return r.helper.Exec(query, originalValue)
-}
-
-// restoreZoneConfig restores a zone configuration to its original value.
-func (r *Runner) restoreZoneConfig(ctx context.Context, l *logger.Logger, rangeName, originalConfig string) error {
-	l.Printf("Restoring zone config for %s to original value", rangeName)
-
-	return r.helper.Exec(originalConfig)
-}
-
-// dropTable drops a table that was created during the test.
-func (r *Runner) dropTable(ctx context.Context, l *logger.Logger, table string) error {
-	l.Printf("Dropping table %s", table)
-	return r.helper.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", table))
-}
-
-// dropSchema drops a schema that was created during the test.
-func (r *Runner) dropSchema(ctx context.Context, l *logger.Logger, schema string) error {
-	l.Printf("Dropping schema %s", schema)
-	return r.helper.Exec(fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schema))
-}
-
-// dropUser drops a user that was created during the test.
-func (r *Runner) dropUser(ctx context.Context, l *logger.Logger, user string) error {
-	l.Printf("Dropping user %s", user)
-	return r.helper.Exec(fmt.Sprintf("DROP USER IF EXISTS %s", user))
-}
-
-// dropDatabase drops a database that was created during the test.
-func (r *Runner) dropDatabase(ctx context.Context, l *logger.Logger, db string) error {
-	l.Printf("Dropping database %s", db)
-	return r.helper.Exec(fmt.Sprintf("DROP DATABASE IF EXISTS %s CASCADE", db))
-}
-
-// recoverFromFailure attempts to recover from an injected failure.
-func (r *Runner) recoverFromFailure(ctx context.Context, l *logger.Logger, failureID string, failer *failures.Failer) error {
-	l.Printf("Recovering from failure %s: %s", failureID, failer.Description())
-	return failer.Recover(ctx, l)
 }
 
 // renameFailedLogger renames the log file to include "FAILED" prefix.
@@ -408,4 +427,48 @@ func (r *Runner) renameFailedLogger(l *logger.Logger) error {
 		"FAILED_"+filepath.Base(currentFileName),
 	)
 	return os.Rename(currentFileName, newLogName)
+}
+
+// ensureClusterRunning checks if the cluster is running and starts it if not.
+// This is a temporary fix to ensure the cluster is available before GC initialization.
+// Ideally, tests should explicitly start the cluster in a Setup step.
+func (r *Runner) ensureClusterRunning(ctx context.Context, t test.Test) error {
+	c := r.testPlan.cluster
+	l := t.L()
+
+	// Try to connect to node 1 to check if cluster is running
+	if r.isClusterRunning(ctx, c, l) {
+		l.Printf("Cluster is already running")
+		return nil
+	}
+
+	// Cluster is not running, start it with default settings
+	l.Printf("Cluster is not running, starting with default settings...")
+	c.Start(ctx, l, option.DefaultStartOpts(), install.MakeClusterSettings(), r.testPlan.crdbNodes)
+
+	// Verify the cluster started successfully
+	if !r.isClusterRunning(ctx, c, l) {
+		return fmt.Errorf("failed to start cluster: unable to connect after start")
+	}
+
+	l.Printf("Cluster started successfully")
+	return nil
+}
+
+// isClusterRunning attempts to connect to the cluster and run a simple query.
+func (r *Runner) isClusterRunning(ctx context.Context, c cluster.Cluster, l *logger.Logger) bool {
+	// Use a short timeout for the connection check
+	checkCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	db, err := c.ConnE(checkCtx, l, 1)
+	if err != nil {
+		return false
+	}
+	defer db.Close()
+
+	// Try a simple query to verify the connection works
+	var result int
+	err = db.QueryRowContext(checkCtx, "SELECT 1").Scan(&result)
+	return err == nil
 }

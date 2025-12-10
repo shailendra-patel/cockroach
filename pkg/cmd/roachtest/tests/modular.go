@@ -7,11 +7,11 @@ package tests
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"strings"
 	"time"
 
-	gosql "database/sql"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/modular"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/modular/operations"
@@ -54,6 +54,15 @@ func registerModular(r registry.Registry) {
 		Run:              runModularRecoveryExample,
 		Cluster:          r.MakeClusterSpec(6, spec.WorkloadNodeCount(1)),
 		Timeout:          30 * time.Minute,
+	})
+	r.Add(registry.TestSpec{
+		Name:             "modular/gc-example",
+		CompatibleClouds: registry.AllClouds,
+		Suites:           registry.Suites(registry.Nightly),
+		Owner:            registry.OwnerTestEng,
+		Run:              runModularGCExample,
+		Cluster:          r.MakeClusterSpec(3),
+		Timeout:          15 * time.Minute,
 	})
 }
 
@@ -420,9 +429,219 @@ func rollbackNodeToVersion(ctx context.Context, rt test.Test, l *logger.Logger, 
 	)
 }
 
+// runModularGCExample demonstrates the Plan-Scoped GC system with actual database operations.
+// It creates tables in the plan schema, modifies cluster settings, and verifies cleanup works.
+func runModularGCExample(ctx context.Context, t test.Test, c cluster.Cluster) {
+	// Create a new modular test with GC and state tracking enabled
+	mod := modular.NewTest(
+		ctx, t.L(), c, c.CRDBNodes(),
+		modular.WithDebug(modular.ClusterStateDebug),
+		modular.WithDebug(modular.GCDebug),
+	)
+
+	// Setup: Start the cluster
+	//mod.Setup("initialize cluster", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+	//	c.Start(ctx, l, option.DefaultStartOpts(), install.MakeClusterSettings(), c.CRDBNodes())
+	//	return nil
+	//})
+
+	// Setup: Verify we can connect
+	mod.Setup("verify cluster connectivity", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		db := h.RandomDBConn()
+		var result int
+		if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&result); err != nil {
+			return fmt.Errorf("failed to verify cluster connectivity: %w", err)
+		}
+		l.Printf("Cluster connectivity verified: SELECT 1 = %d", result)
+		return nil
+	})
+
+	// Main stage: Create tables and modify settings
+	mainStage := mod.NewStage("database-operations", modular.WithStepConcurrency(2))
+
+	// Chain 1: Create a table in the plan schema and insert data
+	mod.InStage(mainStage, "create test table", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// CreateTable uses the plan schema via search_path
+		tableName, err := h.CreateTable("test_data", "id INT PRIMARY KEY, value TEXT")
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+		l.Printf("Created table: %s", tableName)
+
+		// Insert some data using the table name
+		for i := 1; i <= 10; i++ {
+			if err := h.Exec(fmt.Sprintf("INSERT INTO %s VALUES (%d, 'value_%d')", tableName, i, i)); err != nil {
+				return fmt.Errorf("failed to insert row %d: %w", i, err)
+			}
+		}
+		l.Printf("Inserted 10 rows into %s", tableName)
+		return nil
+	}).Then("verify data exists", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// Query tables in the current schema
+		rows, err := h.Query("SELECT table_name FROM [SHOW TABLES]")
+		if err != nil {
+			return fmt.Errorf("failed to list tables: %w", err)
+		}
+		defer rows.Close()
+
+		var tables []string
+		for rows.Next() {
+			var tableName string
+			if err := rows.Scan(&tableName); err != nil {
+				return err
+			}
+			tables = append(tables, tableName)
+		}
+		l.Printf("Tables in current schema: %v", tables)
+		return nil
+	})
+
+	// Chain 2: Modify cluster settings (these get auto-restored by GC)
+	mod.InStage(mainStage, "modify cluster settings", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// SetClusterSetting captures original value and registers cleanup
+		if err := h.SetClusterSetting("kv.range_merge.queue_enabled", "false"); err != nil {
+			return fmt.Errorf("failed to set cluster setting: %w", err)
+		}
+		l.Printf("Disabled range merge queue (will be restored on cleanup)")
+		return nil
+	}).Then("verify setting changed", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		var value string
+		row := h.QueryRow("SHOW CLUSTER SETTING kv.range_merge.queue_enabled")
+		if err := row.Scan(&value); err != nil {
+			return err
+		}
+		l.Printf("Current kv.range_merge.queue_enabled = %s", value)
+		if value != "false" {
+			return fmt.Errorf("expected setting to be 'false', got '%s'", value)
+		}
+		return nil
+	})
+
+	// Chain 3: Create an external database (explicitly registered for cleanup)
+	mod.InStage(mainStage, "create external database", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// CreateDatabase auto-registers cleanup via GC
+		dbName, err := h.CreateDatabase("external_test")
+		if err != nil {
+			return fmt.Errorf("failed to create database: %w", err)
+		}
+		l.Printf("Created external database: %s (will be dropped on cleanup)", dbName)
+		return nil
+	})
+
+	// Validation stage
+	validationStage := mod.NewStage("validation")
+
+	mod.InStage(validationStage, "verify GC state", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		gc := h.GC()
+		if gc == nil {
+			return fmt.Errorf("GC is nil")
+		}
+		if !gc.Enabled() {
+			return fmt.Errorf("GC should be enabled")
+		}
+
+		// Check cleanup stack has entries
+		stackSize := gc.Stack().Size()
+		l.Printf("Cleanup stack has %d entries registered", stackSize)
+
+		// Log schema name
+		l.Printf("Plan schema: %s", gc.Schema().Name)
+
+		return nil
+	})
+
+	// After-test: Verify objects exist before cleanup
+	mod.AfterTest("log pre-cleanup state", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		l.Printf("=== Pre-cleanup state ===")
+
+		// List all schemas
+		rows, err := h.Query("SELECT schema_name FROM [SHOW SCHEMAS] WHERE schema_name LIKE 'test_plan_%'")
+		if err != nil {
+			l.Printf("Failed to list schemas: %v", err)
+		} else {
+			defer rows.Close()
+			for rows.Next() {
+				var schemaName string
+				if err := rows.Scan(&schemaName); err == nil {
+					l.Printf("Found plan schema: %s", schemaName)
+				}
+			}
+		}
+
+		// List all databases
+		dbRows, err := h.Query("SELECT database_name FROM [SHOW DATABASES] WHERE database_name LIKE 'external_test_%'")
+		if err != nil {
+			l.Printf("Failed to list databases: %v", err)
+		} else {
+			defer dbRows.Close()
+			for dbRows.Next() {
+				var dbName string
+				if err := dbRows.Scan(&dbName); err == nil {
+					l.Printf("Found external database: %s", dbName)
+				}
+			}
+		}
+
+		return nil
+	})
+
+	// Generate and execute the test plan
+	planner := mod.NewPlanner()
+	testPlan, err := planner.Plan()
+	if err != nil {
+		t.Fatalf("Failed to generate test plan: %v", err)
+	}
+
+	// Execute the test plan - GC cleanup runs automatically via defer
+	err = modular.RunTestPlan(ctx, t, testPlan)
+	if err != nil {
+		t.Fatalf("Test execution failed: %v", err)
+	}
+
+	// Post-cleanup verification: Check that objects were cleaned up
+	t.L().Printf("=== Post-cleanup verification ===")
+
+	db := c.Conn(ctx, t.L(), 1)
+	defer db.Close()
+
+	// Verify plan schema was dropped
+	var schemaCount int
+	err = db.QueryRowContext(ctx, "SELECT count(*) FROM [SHOW SCHEMAS] WHERE schema_name LIKE 'test_plan_%'").Scan(&schemaCount)
+	if err != nil {
+		t.L().Printf("Warning: Failed to check schemas: %v", err)
+	} else if schemaCount > 0 {
+		t.L().Printf("Warning: %d plan schemas still exist (may be from other tests)", schemaCount)
+	} else {
+		t.L().Printf("Verified: Plan schema was cleaned up")
+	}
+
+	// Verify external database was dropped
+	var dbCount int
+	err = db.QueryRowContext(ctx, "SELECT count(*) FROM [SHOW DATABASES] WHERE database_name LIKE 'external_test_%'").Scan(&dbCount)
+	if err != nil {
+		t.L().Printf("Warning: Failed to check databases: %v", err)
+	} else if dbCount > 0 {
+		t.L().Printf("Warning: %d external databases still exist", dbCount)
+	} else {
+		t.L().Printf("Verified: External database was cleaned up")
+	}
+
+	// Verify cluster setting was restored
+	var settingValue string
+	err = db.QueryRowContext(ctx, "SHOW CLUSTER SETTING kv.range_merge.queue_enabled").Scan(&settingValue)
+	if err != nil {
+		t.L().Printf("Warning: Failed to check cluster setting: %v", err)
+	} else {
+		t.L().Printf("Cluster setting kv.range_merge.queue_enabled = %s (should be restored to original)", settingValue)
+	}
+
+	t.L().Printf("GC example test completed successfully")
+}
+
 func runModularRecoveryExample(ctx context.Context, t test.Test, c cluster.Cluster) {
 	// Create a new modular test with state tracking enabled for recovery testing
-	mod := modular.NewTest(ctx, t.L(), c, c.CRDBNodes(), modular.WithDebug(modular.ClusterStateDebug), modular.CleanupOnFailure())
+	// GC is enabled by default and handles cleanup on both success and failure
+	mod := modular.NewTest(ctx, t.L(), c, c.CRDBNodes(), modular.WithDebug(modular.ClusterStateDebug))
 
 	mod.Setup("initialize cluster", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
 		c.Start(ctx, l, option.DefaultStartOpts(), install.MakeClusterSettings(), c.CRDBNodes())

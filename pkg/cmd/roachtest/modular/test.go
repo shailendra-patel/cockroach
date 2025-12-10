@@ -34,9 +34,8 @@ type TestOptions struct {
 	debugMode              bool
 	debugVerbosity         int
 	debugModules           debugModules
-	// cleanupOnFailure controls whether cluster state cleanup is performed on failure.
-	// Default false (no cleanup) since cleanup is primarily for testing purposes.
-	cleanupOnFailure       bool
+	// gcConfig configures the garbage collector for plan-scoped cleanup.
+	gcConfig GCConfig
 }
 
 // NewTest creates a new modular test.
@@ -49,6 +48,7 @@ func NewTest(
 ) *Test {
 	options := TestOptions{
 		defaultStepConcurrency: 3,
+		gcConfig:               DefaultGCConfig(),
 	}
 
 	// Apply all provided options
@@ -100,7 +100,7 @@ func (t *Test) NewPlanner() TestPlanner {
 		cluster:      t.cluster,
 		crdbNodes:    t.crdbNodes,
 		debugModules: t.options.debugModules,
-		cleanupOnFailure: t.options.cleanupOnFailure,
+		gcConfig:     t.options.gcConfig,
 	}
 }
 
@@ -132,10 +132,4 @@ func AssignStepOrder(s *Stage) {
 func (t *Test) nextHookID() int {
 	t.hookIDCounter++
 	return t.hookIDCounter
-}
-
-// EnableCleanupOnFailure enables cluster state cleanup on test failure.
-// By default, cleanup is disabled since it's primarily for testing purposes.
-func (t *Test) EnableCleanupOnFailure() {
-	t.options.cleanupOnFailure = true
 }

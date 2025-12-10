@@ -25,9 +25,8 @@ type TestPlanner struct {
 
 	debugModules debugModules
 
-	// cleanupOnFailure controls whether cluster state cleanup is performed on failure.
-	// Default false (no cleanup) since cleanup is primarily for testing purposes.
-	cleanupOnFailure bool
+	// gcConfig configures the garbage collector for plan-scoped cleanup.
+	gcConfig GCConfig
 }
 
 // DAG generates a directed acyclic graph representation of all test steps and their dependencies.
@@ -45,15 +44,15 @@ func (p *TestPlanner) Plan() (*TestPlan, error) {
 	p.assignStepIDs(stagePlans)
 
 	return &TestPlan{
-		seed:             p.seed,
-		rng:              p.rng,
-		stagePlans:       stagePlans,
-		ctx:              p.ctx,
-		logger:           p.logger,
-		cluster:          p.cluster,
-		crdbNodes:        p.crdbNodes,
-		debugModules:     p.debugModules,
-		cleanupOnFailure: p.cleanupOnFailure,
+		seed:         p.seed,
+		rng:          p.rng,
+		stagePlans:   stagePlans,
+		ctx:          p.ctx,
+		logger:       p.logger,
+		cluster:      p.cluster,
+		crdbNodes:    p.crdbNodes,
+		debugModules: p.debugModules,
+		gcConfig:     p.gcConfig,
 	}, nil
 }
 
@@ -263,9 +262,8 @@ type TestPlan struct {
 
 	debugModules debugModules
 
-	// cleanupOnFailure controls whether cluster state cleanup is performed on failure.
-	// Default false (no cleanup) since cleanup is primarily for testing purposes.
-	cleanupOnFailure bool
+	// gcConfig configures the garbage collector for plan-scoped cleanup.
+	gcConfig GCConfig
 }
 
 func (p *TestPlan) Steps() []testStep {

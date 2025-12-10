@@ -3,11 +3,14 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "modular",
     srcs = [
+        "cleanup_stack.go",
         "dag_builder.go",
+        "garbage_collector.go",
         "graph.go",
         "helper.go",
         "operation.go",
         "option.go",
+        "plan_schema.go",
         "planner.go",
         "runner.go",
         "state_tracker.go",
@@ -23,6 +26,7 @@ go_library(
         "//pkg/cmd/roachtest/roachtestutil/task",
         "//pkg/cmd/roachtest/test",
         "//pkg/roachprod/failureinjection/failures",
+        "//pkg/roachprod/install",
         "//pkg/roachprod/logger",
         "//pkg/util/ctxgroup",
         "//pkg/util/randutil",
@@ -34,6 +38,7 @@ go_test(
     name = "modular_test",
     srcs = [
         "dag_builder_test.go",
+        "gc_integration_test.go",
         "json_test.go",
         "planner_test.go",
     ],

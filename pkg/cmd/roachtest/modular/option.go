@@ -1,6 +1,10 @@
 package modular
 
-import "github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+import (
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+)
 
 type TestOption func(options *TestOptions)
 type debugModule string
@@ -9,6 +13,7 @@ const (
 	ClusterStateDebug debugModule = "cluster-state"
 	RunnerDebug       debugModule = "runner"
 	PlannerDebug      debugModule = "planner"
+	GCDebug           debugModule = "gc"
 )
 
 type debugModules map[debugModule]bool
@@ -37,11 +42,36 @@ func WithDebug(modules ...debugModule) TestOption {
 	}
 }
 
-// CleanupOnFailure configures the test to perform cleanup of cluster state
-// on failure. This is primarily used for testing the framework itself.
-func CleanupOnFailure() TestOption {
+// WithGCEnabled enables or disables garbage collection for the test.
+// GC is enabled by default. When enabled:
+// - A plan-scoped schema (test_plan_{seed}) is created for object isolation
+// - Global objects (cluster settings, zone configs) are tracked for restoration
+// - Cleanup runs on both success and failure
+func WithGCEnabled(enabled bool) TestOption {
 	return func(options *TestOptions) {
-		options.cleanupOnFailure = true
+		options.gcConfig.Enabled = enabled
+	}
+}
+
+// WithGCDryRun configures the GC to log cleanup statements without executing them.
+// Useful for debugging and testing.
+func WithGCDryRun() TestOption {
+	return func(options *TestOptions) {
+		options.gcConfig.Execute = false
+	}
+}
+
+// WithGCTimeout sets the maximum time allowed for cleanup execution.
+func WithGCTimeout(timeout time.Duration) TestOption {
+	return func(options *TestOptions) {
+		options.gcConfig.Timeout = timeout
+	}
+}
+
+// WithGCContinueOnError configures whether cleanup should continue if individual statements fail.
+func WithGCContinueOnError(continueOnError bool) TestOption {
+	return func(options *TestOptions) {
+		options.gcConfig.ContinueOnError = continueOnError
 	}
 }
 

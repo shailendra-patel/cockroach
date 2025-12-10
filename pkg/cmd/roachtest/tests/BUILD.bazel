@@ -135,6 +135,7 @@ go_library(
         "mixed_version_schemachange.go",
         "mixed_version_sql_stats.go",
         "modular.go",
+        "modular_schemachange.go",
         "multi_region_system_database.go",
         "multi_store_remove.go",
         "multitenant.go",
