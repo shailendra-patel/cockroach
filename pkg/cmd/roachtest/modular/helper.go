@@ -8,9 +8,11 @@ import (
 	"path"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/task"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
@@ -28,18 +30,75 @@ const (
 	logPrefix = "modular-test"
 )
 
+// ddlPrefixes are SQL statement prefixes that must use dedicated Helper methods
+// to ensure proper schema-based garbage collection.
+var ddlPrefixes = []string{
+	"CREATE TABLE",
+	"CREATE INDEX",
+	"CREATE DATABASE",
+	"CREATE SCHEMA",
+	"CREATE USER",
+	"ALTER TABLE",
+	"ALTER INDEX",
+	"ALTER DATABASE",
+	"ALTER SCHEMA",
+	"ALTER USER",
+	"ALTER RANGE",
+	"SET CLUSTER SETTING",
+	"RESET CLUSTER SETTING",
+	"GRANT",
+	"REVOKE",
+	"TRUNCATE",
+}
+
+// ddlMethodGuide maps DDL prefixes to recommended Helper methods.
+var ddlMethodGuide = map[string]string{
+	"CREATE TABLE":          "CreateTable()",
+	"CREATE INDEX":          "CreateIndex()",
+	"CREATE DATABASE":       "CreateDatabase()",
+	"CREATE SCHEMA":         "CreateSchema()",
+	"CREATE USER":           "CreateUser() or CreateUserPassword()",
+	"DROP DATABASE":         "DropDatabase()",
+	"SET CLUSTER SETTING":   "SetClusterSetting()",
+	"RESET CLUSTER SETTING": "ResetClusterSetting()",
+	"ALTER RANGE":           "AlterRange() or AlterAllRanges()",
+	"ALTER TABLE":           "AlterTable() or AddColumn()/DropColumn()",
+	"TRUNCATE":              "TruncateTable()",
+}
+
+// validateNotDDL checks if a query is a DDL statement and panics if so.
+// This enforces that DDL operations go through tracked Helper methods.
+func validateNotDDL(query string) {
+	normalized := strings.ToUpper(strings.TrimSpace(query))
+
+	for _, prefix := range ddlPrefixes {
+		if strings.HasPrefix(normalized, prefix) {
+			suggestion := ddlMethodGuide[prefix]
+			if suggestion == "" {
+				suggestion = "a dedicated Helper method"
+			}
+			panic(fmt.Sprintf(
+				"DDL statement detected in Exec(): %q\n"+
+					"DDL must go through tracked Helper methods for proper cleanup.\n"+
+					"Use %s instead.",
+				query, suggestion,
+			))
+		}
+	}
+}
+
 // Helper provides utilities for modular test steps.
 type Helper struct {
 	defaultService *Service
 	rng            *rand.Rand
 	// taskCount keeps track of the number of tasks started with `helper.Go()`.
 	// The counter is used to generate unique log file names.
-	taskCount    int64
-	cluster      cluster.Cluster
-	logger       *logger.Logger
-	background   task.Manager
-	ctx          context.Context
-	stateTracker *ClusterStateTracker
+	taskCount  int64
+	cluster    cluster.Cluster
+	logger     *logger.Logger
+	background task.Manager
+	ctx        context.Context
+	//stateTracker *ClusterStateTracker
 	// gc is the garbage collector for plan-scoped cleanup.
 	// It manages the plan schema and cleanup of global objects.
 	gc *GarbageCollector
@@ -52,16 +111,6 @@ func (h *Helper) AvailableNodes() option.NodeListOption {
 func (h *Helper) RandomAvailableNode() int {
 	nodes := h.AvailableNodes()
 	return nodes.SeededRandNode(h.rng)[0]
-}
-
-// Connect returns a connection pool to the given node using the default service.
-func (h *Helper) Connect(node int) *gosql.DB {
-	return h.defaultService.Connect(node)
-}
-
-// RandomDBConn returns a connection pool to a random node using the default service.
-func (h *Helper) RandomDBConn() *gosql.DB {
-	return h.defaultService.RandomDBConn(h.rng)
 }
 
 // RandomDB is like RandomDBConn, but also returns the node ID.
@@ -86,23 +135,55 @@ func (h *Helper) QueryRow(query string, args ...interface{}) *gosql.Row {
 // Exec performs `db.ExecContext` on a randomly picked database node.
 // The query and the node picked are logged in the logs of the step
 // that calls this function.
+//
+// IMPORTANT: This method is for DML statements only (INSERT, UPDATE, DELETE).
+// DDL statements (CREATE, DROP, ALTER, etc.) must use dedicated Helper methods
+// like CreateTable(), CreateDatabase(), SetClusterSetting() to ensure proper
+// cleanup tracking. Attempting to run DDL via Exec will panic.
 func (h *Helper) Exec(query string, args ...interface{}) error {
+	validateNotDDL(query)
 	return h.defaultService.Exec(h.rng, query, args...)
 }
 
 // ExecWithGateway is like Exec, but allows the caller to specify the
 // set of nodes that should be used as gateway.
+//
+// IMPORTANT: This method is for DML statements only. See Exec() for details.
 func (h *Helper) ExecWithGateway(
+	nodes option.NodeListOption, query string, args ...interface{},
+) error {
+	validateNotDDL(query)
+	return h.defaultService.ExecWithGateway(h.rng, nodes, query, args...)
+}
+
+// execInternal executes a query without DDL validation.
+// This is used by Helper's DDL methods which are already tracked.
+func (h *Helper) execInternal(query string, args ...interface{}) error {
+	return h.defaultService.Exec(h.rng, query, args...)
+}
+
+// execInternalWithGateway is like execInternal but with specific gateway nodes.
+func (h *Helper) execInternalWithGateway(
 	nodes option.NodeListOption, query string, args ...interface{},
 ) error {
 	return h.defaultService.ExecWithGateway(h.rng, nodes, query, args...)
 }
 
 // CreateTable creates a table with the specified schema.
+// The table is automatically registered for cleanup when GC runs.
 func (h *Helper) CreateTable(namePrefix, schema string) (string, error) {
-	tableName := h.stateTracker.NewTableName(namePrefix)
+	tableName := generateRandomName(namePrefix)
 	query := fmt.Sprintf("CREATE TABLE %s (%s)", tableName, schema)
-	return tableName, h.Exec(query)
+	if err := h.execInternal(query); err != nil {
+		return "", err
+	}
+
+	h.RegisterCleanup(
+		fmt.Sprintf("Drop table %s", tableName),
+		fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", tableName),
+	)
+
+	return tableName, nil
 }
 
 // SetClusterSetting sets a cluster setting and registers restoration on cleanup.
@@ -110,7 +191,7 @@ func (h *Helper) CreateTable(namePrefix, schema string) (string, error) {
 // the original value and register a cleanup statement to restore it.
 func (h *Helper) SetClusterSetting(settingName, newValue string) error {
 	// Capture the current value for restoration during cleanup
-	if h.gc != nil && h.gc.Enabled() {
+	if h.gc.Enabled() {
 		var currentValue string
 		row := h.QueryRow(fmt.Sprintf("SHOW CLUSTER SETTING %s", settingName))
 		if err := row.Scan(&currentValue); err != nil {
@@ -118,7 +199,7 @@ func (h *Helper) SetClusterSetting(settingName, newValue string) error {
 		}
 
 		// Register cleanup to restore original value (LIFO order)
-		h.gc.Stack().PushSQL(
+		h.RegisterCleanup(
 			fmt.Sprintf("Restore cluster setting %s to '%s'", settingName, currentValue),
 			fmt.Sprintf("SET CLUSTER SETTING %s = '%s'", settingName, currentValue),
 		)
@@ -126,7 +207,7 @@ func (h *Helper) SetClusterSetting(settingName, newValue string) error {
 
 	// Use parameterized query for the value but format the setting name
 	query := fmt.Sprintf("SET CLUSTER SETTING %s = $1", settingName)
-	return h.Exec(query, newValue)
+	return h.execInternal(query, newValue)
 }
 
 // ResetClusterSetting resets a cluster setting to its default value.
@@ -141,12 +222,170 @@ func (h *Helper) ResetClusterSetting(settingName string) error {
 		}
 
 		// Register cleanup to restore original value (LIFO order)
-		h.gc.Stack().PushSQL(
+		h.RegisterCleanup(
 			fmt.Sprintf("Restore cluster setting %s to '%s'", settingName, currentValue),
 			fmt.Sprintf("SET CLUSTER SETTING %s = '%s'", settingName, currentValue),
 		)
 	}
-	return h.Exec(fmt.Sprintf("RESET CLUSTER SETTING %s", settingName))
+	return h.execInternal(fmt.Sprintf("RESET CLUSTER SETTING %s", settingName))
+}
+
+// CreateUser creates a user with automatic name generation.
+// The user is automatically registered for cleanup when GC runs.
+func (h *Helper) CreateUser(namePrefix string, args ...string) (string, error) {
+	username := generateRandomName(namePrefix)
+	query := fmt.Sprintf("CREATE USER %s %s", username, joinArgs(args...))
+	if err := h.execInternal(query); err != nil {
+		return "", err
+	}
+
+	h.RegisterCleanup(
+		fmt.Sprintf("Drop user %s", username),
+		fmt.Sprintf("DROP USER IF EXISTS %s", username),
+	)
+
+	return username, nil
+}
+
+func (h *Helper) CreateUserPassword(namePrefix, password string, args ...string) (string, error) {
+	args = append([]string{fmt.Sprintf("WITH PASSWORD %s", password)}, args...)
+	return h.CreateUser(namePrefix, args...)
+}
+
+// CreateDatabase creates a database with automatic name generation and tracking.
+// Since databases are external to the plan schema, cleanup is registered.
+func (h *Helper) CreateDatabase(namePrefix string, args ...string) (string, error) {
+	dbName := generateRandomName(namePrefix)
+	query := fmt.Sprintf("CREATE DATABASE %s %s", dbName, joinArgs(args...))
+	if err := h.execInternal(strings.TrimSpace(query)); err != nil {
+		return "", err
+	}
+
+	h.RegisterCleanup(
+		fmt.Sprintf("Drop database %s", dbName),
+		fmt.Sprintf("DROP DATABASE IF EXISTS %s CASCADE", dbName),
+	)
+
+	return dbName, nil
+}
+
+// RegisterCleanup allows registering a custom cleanup statement.
+// Use this for objects created outside of standard Helper methods,
+// such as databases created by external workloads (TPCC, YCSB, etc.).
+func (h *Helper) RegisterCleanup(description, statement string) {
+	if h.gc != nil && h.gc.Enabled() {
+		h.gc.RegisterCleanup(description, statement)
+	}
+}
+
+// GC returns the garbage collector for direct access if needed.
+// Use with caution; prefer using Helper methods that auto-register cleanup.
+func (h *Helper) GC() *GarbageCollector {
+	return h.gc
+}
+
+// CreateSchema creates a schema with automatic name generation and tracking.
+// The schema is automatically registered for cleanup when GC runs.
+func (h *Helper) CreateSchema(namePrefix string, args ...string) (string, error) {
+	schemaName := generateRandomName(namePrefix)
+	query := fmt.Sprintf("CREATE SCHEMA %s %s", schemaName, joinArgs(args...))
+	if err := h.execInternal(strings.TrimSpace(query)); err != nil {
+		return "", err
+	}
+
+	h.RegisterCleanup(
+		fmt.Sprintf("Drop schema %s", schemaName),
+		fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName),
+	)
+
+	return schemaName, nil
+}
+
+// CreateIndex creates an index with automatic name generation and tracking.
+// The index is automatically registered for cleanup when GC runs.
+func (h *Helper) CreateIndex(namePrefix, database, table string, columns []string, args ...string) (string, error) {
+	indexName := generateRandomName(namePrefix)
+	columnsStr := strings.Join(columns, ", ")
+	tableRef := fmt.Sprintf("%s.%s", database, table)
+	query := fmt.Sprintf("CREATE INDEX %s ON %s (%s) %s", indexName, tableRef, columnsStr, joinArgs(args...))
+	if err := h.execInternal(strings.TrimSpace(query)); err != nil {
+		return "", err
+	}
+
+	h.RegisterCleanup(
+		fmt.Sprintf("Drop index %s on %s", indexName, tableRef),
+		fmt.Sprintf("DROP INDEX IF EXISTS %s@%s CASCADE", tableRef, indexName),
+	)
+
+	return indexName, nil
+}
+
+// AddColumn adds a column to a table.
+// The column is automatically registered for cleanup (DROP COLUMN) when GC runs.
+func (h *Helper) AddColumn(database, table, columnName, columnType string, args ...string) error {
+	tableRef := fmt.Sprintf("%s.%s", database, table)
+	query := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s %s",
+		tableRef, columnName, columnType, joinArgs(args...))
+	if err := h.execInternal(strings.TrimSpace(query)); err != nil {
+		return err
+	}
+
+	h.RegisterCleanup(
+		fmt.Sprintf("Drop column %s from %s", columnName, tableRef),
+		fmt.Sprintf("ALTER TABLE %s DROP COLUMN IF EXISTS %s CASCADE", tableRef, columnName),
+	)
+
+	return nil
+}
+
+// DropTable drops a table.
+func (h *Helper) DropTable(database, table string) error {
+	query := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s CASCADE", database, table)
+	return h.execInternal(query)
+}
+
+// DropIndex drops an index.
+func (h *Helper) DropIndex(database, table, indexName string) error {
+	query := fmt.Sprintf("DROP INDEX IF EXISTS %s.%s@%s CASCADE", database, table, indexName)
+	return h.execInternal(query)
+}
+
+// DropDatabase drops a database.
+func (h *Helper) DropDatabase(database string) error {
+	query := fmt.Sprintf("DROP DATABASE IF EXISTS %s CASCADE", database)
+	return h.execInternal(query)
+}
+
+// DropColumn drops a column from a table.
+func (h *Helper) DropColumn(database, table, columnName string) error {
+	query := fmt.Sprintf("ALTER TABLE %s.%s DROP COLUMN %s CASCADE", database, table, columnName)
+	return h.execInternal(query)
+}
+
+// TruncateTable truncates a table.
+func (h *Helper) TruncateTable(database, table string) error {
+	query := fmt.Sprintf("TRUNCATE TABLE %s.%s", database, table)
+	return h.execInternal(query)
+}
+
+// Grant grants privileges and registers a cleanup to revoke them.
+func (h *Helper) Grant(privilege, objectType, objectName, grantee string) error {
+	query := fmt.Sprintf("GRANT %s ON %s %s TO %s", privilege, objectType, objectName, grantee)
+	if err := h.execInternal(query); err != nil {
+		return err
+	}
+	// Register cleanup to revoke the privilege
+	h.RegisterCleanup(
+		fmt.Sprintf("Revoke %s on %s %s from %s", privilege, objectType, objectName, grantee),
+		fmt.Sprintf("REVOKE %s ON %s %s FROM %s", privilege, objectType, objectName, grantee),
+	)
+	return nil
+}
+
+// Revoke revokes privileges.
+func (h *Helper) Revoke(privilege, objectType, objectName, grantee string) error {
+	query := fmt.Sprintf("REVOKE %s ON %s %s FROM %s", privilege, objectType, objectName, grantee)
+	return h.execInternal(query)
 }
 
 // AlterRange alters a range's zone configuration.
@@ -162,7 +401,7 @@ func (h *Helper) AlterRange(rangeName, zoneConfig string) error {
 			h.logger.Printf("Note: Could not capture original zone config for %s: %v", rangeName, err)
 		} else {
 			// Register cleanup to restore original zone config (LIFO order)
-			h.gc.Stack().PushSQL(
+			h.RegisterCleanup(
 				fmt.Sprintf("Restore zone config for RANGE %s", rangeName),
 				fmt.Sprintf("ALTER RANGE %s CONFIGURE ZONE USING %s", rangeName, currentConfig),
 			)
@@ -194,68 +433,69 @@ func (h *Helper) AlterAllRanges(zoneConfig string) error {
 	return nil
 }
 
-func (h *Helper) CreateUser(namePrefix string, args ...string) (string, error) {
-	username := h.stateTracker.NewUsername(namePrefix)
-	query := fmt.Sprintf("CREATE USER %s %s", username, joinArgs(args...))
-	return username, h.Exec(query)
-}
+// InitWorkload initializes a workload (e.g., bank, tpcc, kv) and returns the database name.
+// The buildCmd callback allows customizing the command with flags.
+// The database name is the same as the workload name.
+func (h *Helper) InitWorkload(
+	workload string,
+	buildCmd func(cmd *roachtestutil.Command) *roachtestutil.Command,
+) (string, error) {
+	dbName := workload
+	node := h.RandomAvailableNode()
 
-func (h *Helper) CreateUserPassword(namePrefix, password string, args ...string) (string, error) {
-	args = append([]string{fmt.Sprintf("WITH PASSWORD %s", password)}, args...)
-	return h.CreateUser(namePrefix, args...)
-}
+	baseCmd := roachtestutil.NewCommand("%s workload init %s", test.DefaultCockroachPath, workload).
+		Flag("db", dbName)
+	if buildCmd != nil {
+		baseCmd = buildCmd(baseCmd)
+	}
+	cmd := baseCmd.Arg("{pgurl:%d}", node).String()
 
-// TODO: InjectFailure
-
-// CreateDatabase creates a database with automatic name generation and tracking.
-// Since databases are external to the plan schema, cleanup is registered.
-func (h *Helper) CreateDatabase(namePrefix string, args ...string) (string, error) {
-	dbName := h.stateTracker.NewDatabaseName(namePrefix)
-	query := fmt.Sprintf("CREATE DATABASE %s %s", dbName, joinArgs(args...))
-	if err := h.Exec(strings.TrimSpace(query)); err != nil {
-		return "", err
+	if err := h.cluster.RunE(h.ctx, option.WithNodes(h.cluster.WorkloadNode()), cmd); err != nil {
+		return "", fmt.Errorf("failed to init workload %s: %w", workload, err)
 	}
 
-	// Register cleanup for external database
-	if h.gc != nil && h.gc.Enabled() {
-		h.gc.Stack().PushSQL(
-			fmt.Sprintf("Drop database %s", dbName),
-			fmt.Sprintf("DROP DATABASE IF EXISTS %s CASCADE", dbName),
-		)
-	}
+	h.RegisterCleanup(
+		fmt.Sprintf("Drop workload database %s", dbName),
+		fmt.Sprintf("DROP DATABASE IF EXISTS %s CASCADE", dbName),
+	)
 
 	return dbName, nil
 }
 
-// RegisterCleanup allows registering a custom cleanup statement.
-// Use this for objects created outside of standard Helper methods,
-// such as databases created by external workloads (TPCC, YCSB, etc.).
-func (h *Helper) RegisterCleanup(description, statement string) {
-	if h.gc != nil && h.gc.Enabled() {
-		h.gc.Stack().PushSQL(description, statement)
+// RunWorkload runs a workload asynchronously and returns a cancel function.
+// The buildCmd callback allows customizing the command with flags (e.g., duration, concurrency).
+func (h *Helper) RunWorkload(
+	workload, dbName string,
+	buildCmd func(cmd *roachtestutil.Command) *roachtestutil.Command,
+) context.CancelFunc {
+	node := h.RandomAvailableNode()
+
+	baseCmd := roachtestutil.NewCommand("%s workload run %s", test.DefaultCockroachPath, workload).
+		Flag("db", dbName)
+	if buildCmd != nil {
+		baseCmd = buildCmd(baseCmd)
 	}
+	cmd := baseCmd.Arg("{pgurl:%d}", node).String()
+
+	return h.GoCommand(cmd, h.cluster.WorkloadNode())
 }
 
-// GC returns the garbage collector for direct access if needed.
-// Use with caution; prefer using Helper methods that auto-register cleanup.
-func (h *Helper) GC() *GarbageCollector {
-	return h.gc
-}
+// RunWorkloadSync runs a workload synchronously (blocking until completion).
+// The buildCmd callback allows customizing the command with flags.
+func (h *Helper) RunWorkloadSync(
+	workload, dbName string,
+	buildCmd func(cmd *roachtestutil.Command) *roachtestutil.Command,
+) error {
+	node := h.RandomAvailableNode()
 
-// CreateSchema creates a schema with automatic name generation and tracking.
-func (h *Helper) CreateSchema(namePrefix string, args ...string) (string, error) {
-	schemaName := h.stateTracker.NewSchemaName(namePrefix)
-	query := fmt.Sprintf("CREATE SCHEMA %s %s", schemaName, joinArgs(args...))
-	return schemaName, h.Exec(strings.TrimSpace(query))
-}
+	baseCmd := roachtestutil.NewCommand("%s workload run %s", test.DefaultCockroachPath, workload).
+		Flag("db", dbName)
+	if buildCmd != nil {
+		baseCmd = buildCmd(baseCmd)
+	}
+	cmd := baseCmd.Arg("{pgurl:%d}", node).String()
 
-// CreateIndex creates an index with automatic name generation and tracking.
-func (h *Helper) CreateIndex(namePrefix, database, table string, columns []string, args ...string) (string, error) {
-	indexName := h.stateTracker.NewIndexName(namePrefix)
-	columnsStr := strings.Join(columns, ", ")
-	tableRef := fmt.Sprintf("%s.%s", database, table)
-	query := fmt.Sprintf("CREATE INDEX %s ON %s (%s) %s", indexName, tableRef, columnsStr, joinArgs(args...))
-	return indexName, h.Exec(strings.TrimSpace(query))
+	return h.cluster.RunE(h.ctx, option.WithNodes(h.cluster.WorkloadNode()), cmd)
 }
 
 // ColumnInfo represents information about a table column.
@@ -466,6 +706,10 @@ func (h *Helper) GoCommand(cmd string, nodes option.NodeListOption) context.Canc
 	}, task.Name(desc))
 }
 
+func (h *Helper) RunCleanup(ctx context.Context) error {
+	return h.gc.RunCleanup(ctx, h.defaultService.RandomDBConn(h.rng))
+}
+
 // loggerFor creates a logger instance to be used by task functions (created by
 // calling `Go` on the helper instance). It is similar to the logger instances
 // created for mixed-version steps, but with the `task_` prefix.
@@ -614,4 +858,8 @@ func handleInternalError(err error) {
 	}
 
 	panic(fmt.Errorf("modular internal error: %w", err))
+}
+
+func generateRandomName(prefix string) string {
+	return fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
 }

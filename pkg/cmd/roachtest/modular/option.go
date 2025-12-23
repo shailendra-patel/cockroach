@@ -68,13 +68,6 @@ func WithGCTimeout(timeout time.Duration) TestOption {
 	}
 }
 
-// WithGCContinueOnError configures whether cleanup should continue if individual statements fail.
-func WithGCContinueOnError(continueOnError bool) TestOption {
-	return func(options *TestOptions) {
-		options.gcConfig.ContinueOnError = continueOnError
-	}
-}
-
 // StageOption configures a Stage.
 type StageOption func(*Stage)
 

@@ -1012,15 +1012,15 @@ func (r *testRunner) runWorker(
 			c.setTest(t)
 
 			var setupErr error
-			//if c.spec.NodeCount > 0 { // skip during tests
-			//	setupErr = c.PutCockroach(ctx, l, t)
-			//}
-			//if setupErr == nil {
-			//	setupErr = c.PutLibraries(ctx, "./lib", t.spec.NativeLibs)
-			//}
-			//if setupErr == nil {
-			//	setupErr = c.PutDeprecatedWorkload(ctx, l, t)
-			//}
+			if c.spec.NodeCount > 0 { // skip during tests
+				setupErr = c.PutCockroach(ctx, l, t)
+			}
+			if setupErr == nil {
+				setupErr = c.PutLibraries(ctx, "./lib", t.spec.NativeLibs)
+			}
+			if setupErr == nil {
+				setupErr = c.PutDeprecatedWorkload(ctx, l, t)
+			}
 
 			if setupErr != nil {
 				// If there was an error setting up the cluster (uploading

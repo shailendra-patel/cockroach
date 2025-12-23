@@ -2,7 +2,6 @@ package operations
 
 import (
 	"context"
-	gosql "database/sql"
 	"fmt"
 	"time"
 
@@ -51,11 +50,8 @@ func InspectTable() modular.Operation {
 
 		l.Printf("Running INSPECT on table %s.%s", dbName, tableName)
 
-		// Get a DB connection that we'll use for all subsequent operations
-		db := h.RandomDBConn()
-
 		// Enable INSPECT command on this connection
-		if _, err := db.Exec("SET enable_inspect_command = true"); err != nil {
+		if err := h.Exec("SET enable_inspect_command = true"); err != nil {
 			return fmt.Errorf("failed to enable INSPECT command: %w", err)
 		}
 
@@ -63,17 +59,17 @@ func InspectTable() modular.Operation {
 		inspectSQL := fmt.Sprintf("INSPECT TABLE %s.%s", dbName, tableName)
 
 		// Use a short statement timeout to force background job execution
-		if _, err := db.Exec("SET statement_timeout = '5s'"); err != nil {
+		if err := h.Exec("SET statement_timeout = '5s'"); err != nil {
 			return fmt.Errorf("failed to set statement timeout: %w", err)
 		}
 		defer func() {
-			if _, resetErr := db.Exec("RESET statement_timeout"); resetErr != nil {
+			if resetErr := h.Exec("RESET statement_timeout"); resetErr != nil {
 				l.Printf("Warning: failed to reset statement timeout: %v", resetErr)
 			}
 		}()
 
 		// Execute INSPECT - may timeout and run as background job
-		_, err = db.Exec(inspectSQL)
+		err = h.Exec(inspectSQL)
 		if err != nil && !isStatementTimeoutError(err) {
 			return fmt.Errorf("INSPECT TABLE failed: %w", err)
 		}
@@ -86,7 +82,7 @@ func InspectTable() modular.Operation {
 			WHERE job_type = 'INSPECT'
 			ORDER BY created DESC
 			LIMIT 1`
-		if err := db.QueryRow(getJobIDSQL).Scan(&jobID); err != nil {
+		if err := h.QueryRow(getJobIDSQL).Scan(&jobID); err != nil {
 			l.Printf("Warning: failed to get INSPECT job ID: %v", err)
 			// If we can't get the job ID, assume the INSPECT ran successfully inline
 			l.Printf("INSPECT TABLE %s.%s completed inline (no job created)", dbName, tableName)
@@ -107,7 +103,7 @@ func InspectTable() modular.Operation {
 				SELECT status, fraction_completed
 				FROM [SHOW JOBS]
 				WHERE job_id = $1`
-			if err := db.QueryRow(checkJobSQL, jobID).Scan(&status, &fractionCompleted); err != nil {
+			if err := h.QueryRow(checkJobSQL, jobID).Scan(&status, &fractionCompleted); err != nil {
 				return fmt.Errorf("failed to query job %d status: %w", jobID, err)
 			}
 
@@ -117,7 +113,7 @@ func InspectTable() modular.Operation {
 				l.Printf("INSPECT job %d completed successfully (100%%)", jobID)
 
 				// Check for any errors found by INSPECT
-				if err := checkInspectErrors(db, jobID); err != nil {
+				if err := checkInspectErrors(h, jobID); err != nil {
 					return err
 				}
 
@@ -147,9 +143,9 @@ func InspectTable() modular.Operation {
 
 // checkInspectErrors checks if there are any errors from the INSPECT job
 // and returns them in a formatted error message.
-func checkInspectErrors(db *gosql.DB, jobID int64) error {
+func checkInspectErrors(h *modular.Helper, jobID int64) error {
 	var errorCount int
-	if err := db.QueryRow(
+	if err := h.QueryRow(
 		fmt.Sprintf("SELECT count(*) FROM [SHOW INSPECT ERRORS FOR JOB %d]", jobID),
 	).Scan(&errorCount); err != nil {
 		return fmt.Errorf("failed to query INSPECT errors for job %d: %w", jobID, err)
@@ -160,7 +156,7 @@ func checkInspectErrors(db *gosql.DB, jobID int64) error {
 	}
 
 	// Get error details
-	rows, err := db.Query(fmt.Sprintf(`
+	rows, err := h.Query(fmt.Sprintf(`
 		SELECT database_name, schema_name, table_name, error_type, details
 		FROM [SHOW INSPECT ERRORS FOR JOB %d WITH DETAILS]`, jobID))
 	if err != nil {

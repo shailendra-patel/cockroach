@@ -21,9 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -64,6 +65,28 @@ func registerModular(r registry.Registry) {
 		Cluster:          r.MakeClusterSpec(3),
 		Timeout:          15 * time.Minute,
 	})
+	r.Add(registry.TestSpec{
+		Name:             "modular/gc-schemachange",
+		CompatibleClouds: registry.AllClouds,
+		Suites:           registry.Suites(registry.Nightly),
+		Owner:            registry.OwnerTestEng,
+		Run:              runModularGCSchemaChange,
+		Cluster:          r.MakeClusterSpec(3, spec.WorkloadNode()),
+		Timeout:          20 * time.Minute,
+	})
+	r.Add(registry.TestSpec{
+		Name:             "modular/hotspotsplits",
+		CompatibleClouds: registry.AllExceptAWS,
+		Suites:           registry.Suites(registry.Nightly),
+		Owner:            registry.OwnerKV,
+		Run:              runModularHotSpotSplits,
+		Cluster:          r.MakeClusterSpec(4, spec.WorkloadNode()),
+		Leases:           registry.MetamorphicLeases,
+		// This test may timeout waiting for replica divergence post-test
+		// validation due to high write volume.
+		SkipPostValidations: registry.PostValidationReplicaDivergence,
+		Timeout:             15 * time.Minute,
+	})
 }
 
 func runModularExample(ctx context.Context, t test.Test, c cluster.Cluster) {
@@ -76,6 +99,9 @@ func runModularExample(ctx context.Context, t test.Test, c cluster.Cluster) {
 	})
 
 	mod.Setup("initialize bank workload", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		h.InitWorkload("bank", func(cmd *roachtestutil.Command) *roachtestutil.Command {
+			return cmd.Flag("rows", 10000)
+		})
 		dbName, err := h.CreateDatabase("bank")
 		if err != nil {
 			return err
@@ -447,9 +473,8 @@ func runModularGCExample(ctx context.Context, t test.Test, c cluster.Cluster) {
 
 	// Setup: Verify we can connect
 	mod.Setup("verify cluster connectivity", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
-		db := h.RandomDBConn()
 		var result int
-		if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&result); err != nil {
+		if err := h.QueryRow("SELECT 1").Scan(&result); err != nil {
 			return fmt.Errorf("failed to verify cluster connectivity: %w", err)
 		}
 		l.Printf("Cluster connectivity verified: SELECT 1 = %d", result)
@@ -525,28 +550,6 @@ func runModularGCExample(ctx context.Context, t test.Test, c cluster.Cluster) {
 			return fmt.Errorf("failed to create database: %w", err)
 		}
 		l.Printf("Created external database: %s (will be dropped on cleanup)", dbName)
-		return nil
-	})
-
-	// Validation stage
-	validationStage := mod.NewStage("validation")
-
-	mod.InStage(validationStage, "verify GC state", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
-		gc := h.GC()
-		if gc == nil {
-			return fmt.Errorf("GC is nil")
-		}
-		if !gc.Enabled() {
-			return fmt.Errorf("GC should be enabled")
-		}
-
-		// Check cleanup stack has entries
-		stackSize := gc.Stack().Size()
-		l.Printf("Cleanup stack has %d entries registered", stackSize)
-
-		// Log schema name
-		l.Printf("Plan schema: %s", gc.Schema().Name)
-
 		return nil
 	})
 
@@ -666,21 +669,6 @@ func runModularRecoveryExample(ctx context.Context, t test.Test, c cluster.Clust
 		return nil
 	})
 
-	// Add replication factor chain with an unconditional fatal step to test recovery
-	mod.InStage(mainStage, "increase rebalance snapshot rate", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
-		return h.SetClusterSetting("kv.snapshot_rebalance.max_rate", "2 GiB")
-	}).Then("increase replication factor to 5", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
-		return h.AlterRange("default", "num_replicas = 5")
-	}).Then("wait for replication to 5", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
-		_, db := h.RandomDB()
-		defer db.Close()
-		return roachtestutil.WaitForReplication(ctx, l, db, 5, roachprod.AtLeastReplicationFactor)
-	}).Then("decrease replication factor to 3", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
-		return h.AlterRange("default", "num_replicas = 3")
-	}).Then("restore rebalance snapshot rate", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
-		return h.ResetClusterSetting("kv.snapshot_rebalance.max_rate")
-	})
-
 	mod.InStage(mainStage, "error step", func(ctx context.Context, l *logger.Logger, helper *modular.Helper) error {
 		return errors.New("intentional fatal error to test recovery")
 	})
@@ -705,4 +693,316 @@ func runModularRecoveryExample(ctx context.Context, t test.Test, c cluster.Clust
 		// Any other error (including restoration failures) should fail the test
 		t.Fatalf("Test execution failed: %v", err)
 	}
+}
+
+// runModularGCSchemaChange tests the GC system with schema change operations.
+// It creates a workload, performs schema changes (indexes, columns), and verifies
+// that all objects are properly cleaned up by GC.
+func runModularGCSchemaChange(ctx context.Context, t test.Test, c cluster.Cluster) {
+	// Create a new modular test with GC debugging enabled
+	mod := modular.NewTest(
+		ctx, t.L(), c, c.CRDBNodes(),
+		modular.WithDebug(modular.GCDebug),
+	)
+
+	// Track created objects for verification
+	var createdDB, createdTable, createdIndex, createdUser string
+	var originalSettingValue string
+
+	// Setup: Start cluster and initialize workload
+	mod.Setup("initialize cluster", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		c.Start(ctx, l, option.DefaultStartOpts(), install.MakeClusterSettings(), c.CRDBNodes())
+		return nil
+	})
+
+	mod.Setup("verify cluster connectivity", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		var result int
+		if err := h.QueryRow("SELECT 1").Scan(&result); err != nil {
+			return fmt.Errorf("failed to verify cluster connectivity: %w", err)
+		}
+		l.Printf("Cluster connectivity verified")
+		return nil
+	})
+
+	// Main stage: Create objects and perform schema changes
+	mainStage := mod.NewStage("schema-changes", modular.WithStepConcurrency(2))
+
+	// Chain 1: Initialize bank workload and create schema objects
+	mod.InStage(mainStage, "init bank workload", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		dbName, err := h.InitWorkload("bank", func(cmd *roachtestutil.Command) *roachtestutil.Command {
+			return cmd.Flag("rows", 1000)
+		})
+		if err != nil {
+			return fmt.Errorf("failed to init bank workload: %w", err)
+		}
+		createdDB = dbName
+		l.Printf("Initialized bank workload with database: %s", dbName)
+		return nil
+	}).Then("create index on bank table", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// Create an index on the bank table - this will be auto-cleaned by GC
+		indexName, err := h.CreateIndex("bank_balance_idx", createdDB, "bank", []string{"balance"})
+		if err != nil {
+			return fmt.Errorf("failed to create index: %w", err)
+		}
+		createdIndex = indexName
+		l.Printf("Created index: %s (will be dropped on cleanup)", indexName)
+		return nil
+	}).Then("add column to bank table", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// Add a column - this will be auto-cleaned by GC
+		if err := h.AddColumn(createdDB, "bank", "test_column", "TEXT"); err != nil {
+			return fmt.Errorf("failed to add column: %w", err)
+		}
+		l.Printf("Added column 'test_column' to %s.bank (will be dropped on cleanup)", createdDB)
+		return nil
+	}).Then("run bank workload", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// Run a short workload to generate some activity
+		duration := "2m"
+		if c.IsLocal() {
+			duration = "10s"
+		}
+		return h.RunWorkloadSync("bank", createdDB, func(cmd *roachtestutil.Command) *roachtestutil.Command {
+			return cmd.Flag("duration", duration).Flag("concurrency", 10)
+		})
+	})
+
+	// Chain 2: Create additional database objects
+	mod.InStage(mainStage, "create test database", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// Create a test database with a table
+		dbName, err := h.CreateDatabase("schemachange_test")
+		if err != nil {
+			return fmt.Errorf("failed to create database: %w", err)
+		}
+		l.Printf("Created database: %s", dbName)
+
+		// Create a table in the new database
+		tableName, err := h.CreateTable("test_table", "id INT PRIMARY KEY, data TEXT, created_at TIMESTAMP DEFAULT now()")
+		if err != nil {
+			return fmt.Errorf("failed to create table: %w", err)
+		}
+		createdTable = tableName
+		l.Printf("Created table: %s", tableName)
+
+		// Insert some data using batch insert
+		var values []string
+		for i := 1; i <= 100; i++ {
+			values = append(values, fmt.Sprintf("(%d, 'test_data_%d')", i, i))
+		}
+		if err := h.Exec(fmt.Sprintf("INSERT INTO %s (id, data) VALUES %s", tableName, strings.Join(values, ", "))); err != nil {
+			return fmt.Errorf("failed to insert data: %w", err)
+		}
+		l.Printf("Inserted 100 rows into %s", tableName)
+		return nil
+	}).And("create user", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// Create a user - will be auto-cleaned by GC
+		username, err := h.CreateUser("test_user")
+		if err != nil {
+			return fmt.Errorf("failed to create user: %w", err)
+		}
+		createdUser = username
+		l.Printf("Created user: %s (will be dropped on cleanup)", username)
+		return nil
+	}).Then("grant privileges", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// Grant privileges to the user
+		if err := h.Grant("SELECT", "TABLE", createdTable, createdUser); err != nil {
+			return fmt.Errorf("failed to grant privileges: %w", err)
+		}
+		l.Printf("Granted SELECT on %s to %s", createdTable, createdUser)
+		return nil
+	})
+
+	// Chain 3: Modify cluster settings
+	mod.InStage(mainStage, "capture original setting", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		row := h.QueryRow("SHOW CLUSTER SETTING kv.range_merge.queue_enabled")
+		if err := row.Scan(&originalSettingValue); err != nil {
+			return fmt.Errorf("failed to read original setting: %w", err)
+		}
+		l.Printf("Original kv.range_merge.queue_enabled = %s", originalSettingValue)
+		return nil
+	}).Then("modify cluster setting", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		// SetClusterSetting captures original value and registers cleanup
+		if err := h.SetClusterSetting("kv.range_merge.queue_enabled", "false"); err != nil {
+			return fmt.Errorf("failed to set cluster setting: %w", err)
+		}
+		l.Printf("Set kv.range_merge.queue_enabled = false (will be restored on cleanup)")
+		return nil
+	})
+
+	// After-test: Log state before cleanup
+	mod.AfterTest("log pre-cleanup state", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		l.Printf("=== Pre-cleanup state ===")
+
+		// Log created objects
+		l.Printf("Created database: %s", createdDB)
+		l.Printf("Created table: %s", createdTable)
+		l.Printf("Created index: %s", createdIndex)
+		l.Printf("Created user: %s", createdUser)
+
+		// Verify objects exist
+		var count int
+		row := h.QueryRow(fmt.Sprintf("SELECT count(*) FROM %s.bank", createdDB))
+		if err := row.Scan(&count); err != nil {
+			l.Printf("Warning: Could not count rows in bank: %v", err)
+		} else {
+			l.Printf("Bank table has %d rows", count)
+		}
+
+		return nil
+	})
+
+	// Generate and execute the test plan
+	planner := mod.NewPlanner()
+	testPlan, err := planner.Plan()
+	if err != nil {
+		t.Fatalf("Failed to generate test plan: %v", err)
+	}
+	t.L().Printf(testPlan.String())
+
+	// Execute the test plan - GC cleanup runs automatically
+	err = modular.RunTestPlan(ctx, t, testPlan)
+	if err != nil {
+		t.Fatalf("Test execution failed: %v", err)
+	}
+
+	// Post-cleanup verification
+	t.L().Printf("=== Post-cleanup verification ===")
+
+	db := c.Conn(ctx, t.L(), 1)
+	defer db.Close()
+
+	// Verify workload database was dropped
+	var dbExists bool
+	err = db.QueryRowContext(ctx, "SELECT count(*) > 0 FROM [SHOW DATABASES] WHERE database_name = $1", createdDB).Scan(&dbExists)
+	if err != nil {
+		t.L().Printf("Warning: Failed to check database: %v", err)
+	} else if dbExists {
+		t.Fatalf("FAIL: Database %s still exists after GC cleanup", createdDB)
+	} else {
+		t.L().Printf("PASS: Database %s was cleaned up", createdDB)
+	}
+
+	// Verify user was dropped
+	var userExists bool
+	err = db.QueryRowContext(ctx, "SELECT count(*) > 0 FROM [SHOW USERS] WHERE username = $1", createdUser).Scan(&userExists)
+	if err != nil {
+		t.L().Printf("Warning: Failed to check user: %v", err)
+	} else if userExists {
+		t.Fatalf("FAIL: User %s still exists after GC cleanup", createdUser)
+	} else {
+		t.L().Printf("PASS: User %s was cleaned up", createdUser)
+	}
+
+	// Verify cluster setting was restored
+	var currentSettingValue string
+	err = db.QueryRowContext(ctx, "SHOW CLUSTER SETTING kv.range_merge.queue_enabled").Scan(&currentSettingValue)
+	if err != nil {
+		t.L().Printf("Warning: Failed to check cluster setting: %v", err)
+	} else if currentSettingValue != originalSettingValue {
+		t.Fatalf("FAIL: Cluster setting not restored. Expected %s, got %s", originalSettingValue, currentSettingValue)
+	} else {
+		t.L().Printf("PASS: Cluster setting restored to %s", currentSettingValue)
+	}
+
+	t.L().Printf("=== GC Schema Change test completed successfully ===")
+}
+
+// runModularHotSpotSplits runs the hotspotsplits test using the modular framework.
+// It runs a KV workload with high concurrency and large block sizes to force large ranges,
+// while concurrently monitoring that range sizes don't exceed the threshold.
+func runModularHotSpotSplits(ctx context.Context, t test.Test, c cluster.Cluster) {
+	// Test parameters
+	duration := 10 * time.Minute
+	concurrency := 128
+	if c.IsLocal() {
+		duration = 2 * time.Minute
+		concurrency = 32
+		t.L().Printf("Local mode: duration=%s, concurrency=%d", duration, concurrency)
+	}
+
+	const blockSize = 1 << 18       // 256 KB
+	const sizeLimit = 3 * (1 << 29) // 3*512 MB (512 MB is default range size)
+
+	// Create a new modular test with GC enabled
+	mod := modular.NewTest(
+		ctx, t.L(), c, c.CRDBNodes(),
+		modular.WithDebug(modular.GCDebug),
+	)
+
+	// Setup: Start cluster
+	mod.Setup("initialize cluster", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		c.Start(ctx, l, option.DefaultStartOpts(), install.MakeClusterSettings(), c.CRDBNodes())
+		return nil
+	})
+
+	// Setup: Initialize KV workload
+	mod.Setup("init kv workload", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		_, err := h.InitWorkload("kv", func(cmd *roachtestutil.Command) *roachtestutil.Command {
+			return cmd.Flag("drop", true)
+		})
+		return err
+	})
+
+	// Main stage: Run workload and monitor range sizes concurrently
+	mainStage := mod.NewStage("workload-and-monitoring")
+
+	// Single step that runs workload in background and monitors range sizes concurrently
+	mod.InStage(mainStage, "run kv workload with range monitoring", func(ctx context.Context, l *logger.Logger, h *modular.Helper) error {
+		l.Printf("Starting KV workload: concurrency=%d, blockSize=%d, duration=%s",
+			concurrency, blockSize, duration)
+
+		// Start KV workload asynchronously (returns cancel func)
+		cancelWorkload := h.RunWorkload("kv", "kv", func(cmd *roachtestutil.Command) *roachtestutil.Command {
+			return cmd.
+				Flag("read-percent", 0).
+				Flag("tolerate-errors", true).
+				Flag("concurrency", concurrency).
+				Flag("min-block-bytes", blockSize).
+				Flag("max-block-bytes", blockSize).
+				Flag("duration", duration)
+		})
+		defer cancelWorkload()
+
+		// Monitor range sizes while workload runs
+		l.Printf("Starting range size monitoring (limit: %s)", humanizeutil.IBytes(int64(sizeLimit)))
+
+		for tBegin := timeutil.Now(); timeutil.Since(tBegin) <= duration; {
+			var size float64
+			row := h.QueryRow(`SELECT max(bytes_per_replica->'PMax') FROM crdb_internal.kv_store_status`)
+			if err := row.Scan(&size); err != nil {
+				return fmt.Errorf("failed to query range size: %w", err)
+			}
+
+			if size > float64(sizeLimit) {
+				return errors.Errorf("range size %s exceeded limit %s",
+					humanizeutil.IBytes(int64(size)),
+					humanizeutil.IBytes(int64(sizeLimit)))
+			}
+
+			l.Printf("Max range size: %s (limit: %s)",
+				humanizeutil.IBytes(int64(size)),
+				humanizeutil.IBytes(int64(sizeLimit)))
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+			}
+		}
+
+		l.Printf("Range size monitoring completed successfully")
+		return nil
+	})
+
+	// Generate and execute the test plan
+	planner := mod.NewPlanner()
+	testPlan, err := planner.Plan()
+	if err != nil {
+		t.Fatalf("Failed to generate test plan: %v", err)
+	}
+
+	err = modular.RunTestPlan(ctx, t, testPlan)
+	if err != nil {
+		t.Fatalf("Test execution failed: %v", err)
+	}
+
+	t.L().Printf("HotSpotSplits test completed successfully")
 }

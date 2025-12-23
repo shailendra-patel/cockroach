@@ -25,31 +25,15 @@ var (
 
 // Runner executes a generated test plan from the modular framework.
 type Runner struct {
-	testPlan     *TestPlan
-	helper       *Helper
-	stateTracker *ClusterStateTracker
-	gc           *GarbageCollector
+	testPlan *TestPlan
+	helper   *Helper
 }
 
 // NewRunner creates a new runner for executing a test plan.
 func NewRunner(testPlan *TestPlan) *Runner {
-	clusterStateLogger := testPlan.debugModules.NewLogger(testPlan.logger, ClusterStateDebug)
-	gcLogger := testPlan.debugModules.NewLogger(testPlan.logger, GCDebug)
-
-	// Create GC with connection function (will be set up properly in initializeHelper)
-	// For now, create with a placeholder that will be replaced
-	gc := NewGarbageCollector(
-		testPlan.seed,
-		nil, // connFunc will be set in initializeHelper
-		gcLogger,
-		testPlan.gcConfig,
-	)
-
 	return &Runner{
-		testPlan:     testPlan,
-		helper:       &Helper{rng: testPlan.rng},
-		stateTracker: NewClusterStateTracker(clusterStateLogger),
-		gc:           gc,
+		testPlan: testPlan,
+		helper:   &Helper{rng: testPlan.rng},
 	}
 }
 
@@ -113,38 +97,21 @@ func RunPlan(ctx context.Context, l *logger.Logger, c cluster.Cluster, operation
 func (r *Runner) Run(ctx context.Context, t test.Test) error {
 	l := t.L()
 
-	// Phase 0: Ensure the cluster is running before any initialization.
-	// This is a temporary fix - ideally tests should explicitly start the cluster
-	// in a Setup step, but for now we auto-start if needed.
-	if r.testPlan.cluster != nil {
-		if err := r.ensureClusterRunning(ctx, t); err != nil {
-			return fmt.Errorf("failed to ensure cluster is running: %w", err)
-		}
-	}
-
-	// Phase 1: Set up basic GC connection (without search_path) and create schema
-	// This must happen BEFORE we set up helper connections with search_path
-	if r.gc.Enabled() && r.testPlan.cluster != nil {
-		// Set up a basic connection for schema creation (no search_path yet)
-		r.gc.connFunc = func() *gosql.DB {
-			return r.testPlan.cluster.Conn(ctx, t.L(), 1)
-		}
-
-		// Create the plan schema
-		if err := r.gc.Initialize(ctx); err != nil {
-			return fmt.Errorf("failed to initialize GC: %w", err)
-		}
-	}
-
-	// Phase 2: Initialize helper with connections that use the plan schema
-	// Now that schema exists, connections can safely set search_path to it
+	// TODO: Phase 0: Ensure the cluster is running before any initialization.
+	// This is a temporary fix - ideally the framework should do this as
+	// setup step implicitly.
+	//if r.testPlan.cluster != nil {
+	//	if err := r.ensureClusterRunning(ctx, t); err != nil {
+	//		return fmt.Errorf("failed to ensure cluster is running: %w", err)
+	//	}
+	//}
 	r.initializeHelper(ctx, t)
 
 	// Always run cleanup at the end (success or failure)
 	defer func() {
-		if r.gc.Enabled() {
+		if r.helper.gc.Enabled() {
 			l.Printf("Executing cleanup...")
-			if err := r.gc.ExecuteCleanup(ctx); err != nil {
+			if err := r.helper.RunCleanup(ctx); err != nil {
 				l.Printf("Cleanup completed with errors: %v", err)
 			}
 		}
@@ -174,8 +141,8 @@ func (r *Runner) initializeHelper(ctx context.Context, t test.Test) {
 	// Initialize helper with context and cluster information
 	r.helper.ctx = ctx
 	r.helper.logger = t.L()
-	r.helper.stateTracker = r.stateTracker
-	r.helper.gc = r.gc
+	//r.helper.stateTracker = r.stateTracker
+	r.helper.gc = NewGarbageCollector(r.helper.logger, DefaultGCConfig())
 
 	// Use the test's task management interface
 	r.helper.background = &testTaskManager{test: t}
@@ -192,23 +159,8 @@ func (r *Runner) initializeHelper(ctx context.Context, t test.Test) {
 	// Set up connection function if cluster is available
 	var connFunc func(int) *gosql.DB
 	if c != nil {
-		// Build connection options, including search_path if GC is enabled
-		var connOpts []option.OptionFunc
-		if r.gc.Enabled() {
-			// Set search_path to plan schema so unqualified table names use it.
-			// Note: We only include the plan schema here, not "public", because
-			// the comma in "schema, public" causes parsing issues in connection options.
-			// Public schema objects can be accessed with explicit qualification if needed.
-			connOpts = append(connOpts, option.ConnectionOption("options", "-c search_path="+r.gc.Schema().Name))
-		}
-
 		connFunc = func(node int) *gosql.DB {
-			return c.Conn(ctx, t.L(), node, connOpts...)
-		}
-
-		// Update GC with the connection function (uses node 1 by default for cleanup)
-		r.gc.connFunc = func() *gosql.DB {
-			return c.Conn(ctx, t.L(), 1, connOpts...)
+			return c.Conn(ctx, t.L(), node)
 		}
 	}
 
@@ -298,7 +250,6 @@ func (r *Runner) executeSteps(ctx context.Context, l *logger.Logger) error {
 		prefix := fmt.Sprintf("FINISHED [%s]", duration)
 		r.logStage(prefix, stageName, stageLogger)
 
-		r.stateTracker.LogClusterStateDebug(fmt.Sprintf("after stage: %s", stageName))
 	}
 
 	l.Printf("All stages completed successfully")
@@ -325,9 +276,6 @@ func (r *Runner) executeStage(ctx context.Context, l *logger.Logger, stagePlan s
 		prefix := fmt.Sprintf("FINISHED [%s]", duration)
 		r.logStep(prefix, step.stepID, step.Description(), stepLogger)
 
-		// Print tracked state after each step for debugging and visibility
-		stateOutput := r.stateTracker.PrintTrackedState()
-		stepLogger.Printf("State after step completion:\n%s", stateOutput)
 	}
 
 	return nil
@@ -392,25 +340,25 @@ func (r *Runner) stageError(ctx context.Context, err error, stageName string, l 
 // recoverFromFailures attempts to recover from all injected failures.
 // This is called during cleanup to ensure the cluster is returned to a healthy state.
 func (r *Runner) recoverFromFailures(ctx context.Context, l *logger.Logger) error {
-	failureMap := r.stateTracker.GetTrackedFailures()
-	if len(failureMap) == 0 {
-		return nil
-	}
-
-	l.Printf("Recovering from %d injected failures...", len(failureMap))
-	var lastErr error
-	for failureID, failer := range failureMap {
-		l.Printf("Recovering from failure %s: %s", failureID, failer.Description())
-		if err := failer.Recover(ctx, l); err != nil {
-			l.Printf("Failed to recover from failure %s: %v", failureID, err)
-			lastErr = err
-			// Continue with other recoveries
-		}
-	}
-
-	if lastErr != nil {
-		return fmt.Errorf("failure recovery completed with errors")
-	}
+	//failureMap := r.stateTracker.GetTrackedFailures()
+	//if len(failureMap) == 0 {
+	//	return nil
+	//}
+	//
+	//l.Printf("Recovering from %d injected failures...", len(failureMap))
+	//var lastErr error
+	//for failureID, failer := range failureMap {
+	//	l.Printf("Recovering from failure %s: %s", failureID, failer.Description())
+	//	if err := failer.Recover(ctx, l); err != nil {
+	//		l.Printf("Failed to recover from failure %s: %v", failureID, err)
+	//		lastErr = err
+	//		// Continue with other recoveries
+	//	}
+	//}
+	//
+	//if lastErr != nil {
+	//	return fmt.Errorf("failure recovery completed with errors")
+	//}
 	l.Printf("Failure recovery completed successfully")
 	return nil
 }
